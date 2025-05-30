@@ -4,8 +4,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <unordered_map>
 #include <chrono>
-#include <thread>
+#include <cmath>            /* added so std::fabs is declared */
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -13,12 +14,8 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
-#include "protocol.h"     
-#include <calcLib.h>     
-
-
-// Helpers                                                               
-
+#include "protocol.h"
+#include <calcLib.h>
 
 #ifdef DEBUG
 #   define DBG(x) do{ x; }while(0)
@@ -26,217 +23,238 @@
 #   define DBG(x) do{}while(0)
 #endif
 
-static constexpr int   MAX_TRIES         = 3;          // 1 original + 2 retransmissions
-static constexpr auto  WAIT              = std::chrono::seconds{2};
-static constexpr uint8_t SUPP_MAJ_VER    = 1;
-static constexpr uint8_t SUPP_MIN_VER    = 0;
+static constexpr uint8_t SUPP_MAJ_VER = 1;
+static constexpr uint8_t SUPP_MIN_VER = 0;
+static constexpr int     JOB_TTL_S    = 10;
 
-/* Convert the textual <host:port> argument to a sockaddr (IPv4 / IPv6) */
-static int resolveDest(const std::string& hp, sockaddr_storage& out, socklen_t& len)
-{
-    auto colon = hp.rfind(':');
-    if (colon == std::string::npos)
-        return -1;
+/* “Composite-key” for unordered_map to stringify sockaddr_storage  */
+struct AddrKey {
+    sockaddr_storage s{};
+    socklen_t        len{};
 
-    std::string host = hp.substr(0, colon);
-    std::string port = hp.substr(colon + 1);
-
-    addrinfo  hints{}, *res = nullptr;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    int rv = getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
-    if (rv) {
-        std::cerr << "getaddrinfo: " << gai_strerror(rv) << '\n';
-        return -1;
+    bool operator==(const AddrKey& o) const
+    {
+        if (len != o.len) return false;
+        return std::memcmp(&s, &o.s, len) == 0;
     }
-    /* Pick the first address that works. */
-    memcpy(&out, res->ai_addr, res->ai_addrlen);
-    len = res->ai_addrlen;
-    freeaddrinfo(res);
-    return 0;
-}
+};
+struct AddrKeyHash {
+    std::size_t operator()(const AddrKey& k) const noexcept
+    {
+        const std::uint64_t* p = reinterpret_cast<const std::uint64_t*>(&k.s);
+        std::size_t h = 0;
+        for (std::size_t i = 0; i < sizeof(k.s)/sizeof(std::uint64_t); ++i)
+            h ^= p[i] + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        return h;
+    }
+};
 
-/* Pretty-print an address. */
-static std::string addrToString(const sockaddr_storage& s)
+struct Job {
+    uint32_t            id{};
+    uint32_t            arith{};
+    int32_t             ia{}, ib{}, ires{};
+    double              fa{}, fb{}, fres{};
+    std::chrono::steady_clock::time_point deadline{};
+};
+
+using JobMap = std::unordered_map<AddrKey, Job, AddrKeyHash>;
+
+static std::string addrToString(const sockaddr_storage& s, socklen_t len)
 {
     char hbuf[NI_MAXHOST]{}, pbuf[NI_MAXSERV]{};
-    getnameinfo(reinterpret_cast<const sockaddr*>(&s), sizeof(s),
+    getnameinfo(reinterpret_cast<const sockaddr*>(&s), len,
                 hbuf, sizeof(hbuf), pbuf, sizeof(pbuf),
                 NI_NUMERICHOST | NI_NUMERICSERV);
     return std::string{hbuf} + ":" + pbuf;
 }
 
-/* Send a buffer and wait (with timeout) for the next datagram. */
-static ssize_t txRxWithRetry(int sock,
-                             const void* sndBuf, size_t sndLen,
-                             void*       rcvBuf, size_t rcvLen)
-{
-    for (int attempt = 1; attempt <= MAX_TRIES; ++attempt)
-    {
-        if (send(sock, sndBuf, sndLen, 0) != static_cast<ssize_t>(sndLen))
-            perror("send");
-
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(sock, &rfds);
-
-        timeval tv{};
-        tv.tv_sec  = WAIT.count();
-
-        int rv = select(sock + 1, &rfds, nullptr, nullptr, &tv);
-        if (rv > 0)
-        {
-            ssize_t got = recv(sock, rcvBuf, rcvLen, 0);
-            if (got >= 0) return got;
-        }
-        /* timed out – try again */
-        DBG(std::cerr << "Timeout #" << attempt << ", retransmitting …\n");
-    }
-    return -1;      // exhausted all retries
-}
-
-//app
+//main
 
 int main(int argc, char* argv[])
 {
     if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <host:port>\n";
+        std::cerr << "Usage: " << argv[0] << " <bind-host:port>\n";
         return 1;
     }
-
-    /* resolve dest */
-    sockaddr_storage dest{};
-    socklen_t        destLen{};
-    if (resolveDest(argv[1], dest, destLen) != 0)
-        return 1;
-
-    std::cout << "Host " << argv[1] << ".\n";
-
-    /* open socket */
-    int sock = socket(dest.ss_family, SOCK_DGRAM, 0);
-    if (sock < 0) { perror("socket"); return 1; }
-
-    if (connect(sock,
-                reinterpret_cast<sockaddr*>(&dest), destLen) != 0)
-    { perror("connect"); return 1; }
-
-#ifdef DEBUG
-    /* Show the locally bound address */
-    sockaddr_storage local{};
-    socklen_t lLen = sizeof(local);
-    getsockname(sock, reinterpret_cast<sockaddr*>(&local), &lLen);
-    std::cerr << "Connected to " << addrToString(dest)
-              << " local "        << addrToString(local) << '\n';
-#endif
-
-    /* handshake: HELLO */
-    calcMessage hello{};
-    hello.type          = htons(22);
-    hello.message       = htonl(0);
-    hello.protocol      = htons(17);        // UDP
-    hello.major_version = htons(SUPP_MAJ_VER);
-    hello.minor_version = htons(SUPP_MIN_VER);
-
-    std::aligned_storage_t<sizeof(calcProtocol) ,alignof(calcProtocol)> rxBuf; // big enough
-    ssize_t got = txRxWithRetry(sock,
-                                &hello, sizeof(hello),
-                                &rxBuf, sizeof(rxBuf));
-
-    if (got < 0) {
-        std::cerr << "ERROR: server did not answer within 6 s, giving up.\n";
+    /* bind addr */
+    std::string hp{argv[1]};
+    auto colon = hp.rfind(':');
+    if (colon == std::string::npos) {
+        std::cerr << "Invalid address format.\n";
         return 1;
     }
+    std::string host = hp.substr(0, colon);
+    std::string port = hp.substr(colon + 1);
 
-    /*  decode reply  */
-    if (static_cast<size_t>(got) == sizeof(calcMessage)) {
-        auto* cm = reinterpret_cast<calcMessage*>(&rxBuf);
-        if (ntohs(cm->message) == 2) {
-            std::cerr << "Server replied NOT OK – protocol version rejected.\n";
-            return 1;
-        }
-        std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags    = AI_PASSIVE;
+
+    if (int rv = getaddrinfo(host.c_str(), port.c_str(), &hints, &res); rv) {
+        std::cerr << "getaddrinfo: " << gai_strerror(rv) << '\n';
         return 1;
     }
-    if (static_cast<size_t>(got) != sizeof(calcProtocol)) {
-        std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
-        return 1;
-    }
-
-    auto* task = reinterpret_cast<calcProtocol*>(&rxBuf);
-
-    /* host-endian copies                                            */
-    uint16_t srvType  = ntohs(task->type);
-    uint32_t id       = ntohl(task->id);
-    uint32_t arith    = ntohl(task->arith);
-    int32_t  a        = ntohl(task->inValue1);
-    int32_t  b        = ntohl(task->inValue2);
-    double   fa       = task->flValue1;
-    double   fb       = task->flValue2;
-
-    /*  print task */
-    const char* opStr = nullptr;
-    double      fRes  = 0.0;
-    int32_t     iRes  = 0;
-
-    switch (arith)
+    int sock = -1;
+    for (addrinfo* p = res; p; p = p->ai_next)
     {
-        case 1: opStr="add";  iRes = a + b;               break;
-        case 2: opStr="sub";  iRes = a - b;               break;
-        case 3: opStr="mul";  iRes = a * b;               break;
-        case 4: opStr="div";  iRes = a / b;               break;
-        case 5: opStr="fadd"; fRes = fa + fb;             break;
-        case 6: opStr="fsub"; fRes = fa - fb;             break;
-        case 7: opStr="fmul"; fRes = fa * fb;             break;
-        case 8: opStr="fdiv"; fRes = fa / fb;             break;
-        default:
-            std::cerr << "Unknown operator from server.\n";
-            return 1;
+        sock = socket(p->ai_family, p->ai_socktype, 0);
+        if (sock < 0) continue;
+        if (bind(sock, p->ai_addr, p->ai_addrlen) == 0) {
+            std::cout << "Listening on "
+                      << addrToString(*reinterpret_cast<sockaddr_storage*>(p->ai_addr),
+                                      p->ai_addrlen) << '\n';
+            break;
+        }
+        close(sock);
+        sock = -1;
     }
+    freeaddrinfo(res);
+    if (sock < 0) { perror("bind"); return 1; }
 
-    std::cout << "ASSIGNMENT: " << opStr << ' '
-              << ((arith <= 4) ? std::to_string(a) : std::to_string(fa)) << ' '
-              << ((arith <= 4) ? std::to_string(b) : std::to_string(fb)) << '\n';
+    /* init libs  */
+    initCalcLib();
+    uint32_t nextId = 1;
+    JobMap   jobs;
 
-    DBG(if (arith <= 4)
-        std::cerr << "Calculated the result to " << iRes << '\n';
-        else
-        std::cerr << "Calculated the result to "
-                  << std::setprecision(8) << fRes << '\n';);
+    /*  main loop  */
+    for (;;)
+    {
+        sockaddr_storage from{};
+        socklen_t        fromLen = sizeof(from);
 
-    /* send result  */
-    calcProtocol reply{};
-    reply.type          = htons(2);     // client to server
-    reply.major_version = htons(SUPP_MAJ_VER);
-    reply.minor_version = htons(SUPP_MIN_VER);
-    reply.id            = htonl(id);
-    reply.arith         = htonl(arith);
-    reply.inValue1      = htonl(a);
-    reply.inValue2      = htonl(b);
-    reply.inResult      = htonl(iRes);
-    reply.flValue1      = fa;
-    reply.flValue2      = fb;
-    reply.flResult      = fRes;
+        std::aligned_storage_t<
+            (sizeof(calcProtocol) > sizeof(calcMessage)
+             ? sizeof(calcProtocol) : sizeof(calcMessage)),
+            alignof(calcProtocol)> buf;
 
-    calcMessage verdict{};
-    got = txRxWithRetry(sock,
-                        &reply, sizeof(reply),
-                        &verdict, sizeof(verdict));
-    if (got < 0) {
-        std::cerr << "ERROR: server did not confirm within 6 s, giving up.\n";
-        return 1;
+        ssize_t got = recvfrom(sock, &buf, sizeof(buf), 0,
+                               reinterpret_cast<sockaddr*>(&from), &fromLen);
+        if (got < 0) { perror("recvfrom"); continue; }
+
+        AddressLoop:
+        std::string fromStr = addrToString(from, fromLen);
+        std::cout << "RX " << got << " B from " << fromStr << '\n';
+
+        /* HELLO message */
+        if (static_cast<size_t>(got) == sizeof(calcMessage))
+        {
+            auto* cm = reinterpret_cast<calcMessage*>(&buf);
+            uint16_t typ = ntohs(cm->type);
+            uint32_t msg = ntohl(cm->message);
+
+            if (typ != 22 || msg != 0 ||
+                ntohs(cm->major_version) != SUPP_MAJ_VER ||
+                ntohs(cm->minor_version) != SUPP_MIN_VER)
+            {
+                calcMessage rej{};
+                rej.type          = htons(2);
+                rej.message       = htonl(2);
+                rej.protocol      = htons(17);
+                rej.major_version = htons(SUPP_MAJ_VER);
+                rej.minor_version = htons(SUPP_MIN_VER);
+                sendto(sock, &rej, sizeof(rej), 0,
+                       reinterpret_cast<sockaddr*>(&from), fromLen);
+                continue;
+            }
+            char* op  = randomType();
+            bool  fp  = (op[0] == 'f');
+            Job   job;
+            job.id     = nextId++;
+            job.arith  = fp ? (strcmp(op,"fadd")==0?5:strcmp(op,"fsub")==0?6:strcmp(op,"fmul")==0?7:8)
+                            : (strcmp(op,"add")==0?1:strcmp(op,"sub")==0?2:strcmp(op,"mul")==0?3:4);
+
+            if (fp) {
+                job.fa = randomFloat();
+                job.fb = randomFloat();
+                switch (job.arith) {
+                    case 5: job.fres = job.fa + job.fb; break;
+                    case 6: job.fres = job.fa - job.fb; break;
+                    case 7: job.fres = job.fa * job.fb; break;
+                    case 8: job.fres = job.fa / job.fb; break;
+                }
+            } else {
+                job.ia = randomInt();
+                job.ib = randomInt();
+                switch (job.arith) {
+                    case 1: job.ires = job.ia + job.ib; break;
+                    case 2: job.ires = job.ia - job.ib; break;
+                    case 3: job.ires = job.ia * job.ib; break;
+                    case 4: job.ires = job.ia / job.ib; break;
+                }
+            }
+            job.deadline = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(JOB_TTL_S);
+
+            /* Save job */
+            AddrKey k{from, fromLen};
+            jobs[k] = job;
+
+            /* Send assignment */
+            calcProtocol tp{};
+            tp.type          = htons(1);
+            tp.major_version = htons(SUPP_MAJ_VER);
+            tp.minor_version = htons(SUPP_MIN_VER);
+            tp.id            = htonl(job.id);
+            tp.arith         = htonl(job.arith);
+            tp.inValue1      = htonl(job.ia);
+            tp.inValue2      = htonl(job.ib);
+            tp.inResult      = 0;
+            tp.flValue1      = job.fa;
+            tp.flValue2      = job.fb;
+            tp.flResult      = 0.0;
+
+            sendto(sock, &tp, sizeof(tp), 0,
+                   reinterpret_cast<sockaddr*>(&from), fromLen);
+            continue;
+        }
+
+        /*  RESULT message */
+        if (static_cast<size_t>(got) == sizeof(calcProtocol))
+        {
+            auto* cp  = reinterpret_cast<calcProtocol*>(&buf);
+            uint16_t typ = ntohs(cp->type);
+            if (typ != 2) continue;     // not client to server result
+
+            AddrKey k{from, fromLen};
+            auto it = jobs.find(k);
+            bool ok = false;
+
+            if (it != jobs.end() && it->second.id == ntohl(cp->id)) {
+                Job& job = it->second;
+                if (job.arith <= 4) {
+                    ok = (job.ires == ntohl(cp->inResult));
+                } else {
+                    double diff = std::fabs(job.fres - cp->flResult);
+                    ok = diff < 1e-4;
+                }
+                jobs.erase(it);
+            }
+            /* build verdict */
+            calcMessage v{};
+            v.type          = htons(2);
+            v.message       = htonl(ok ? 1 : 2);
+            v.protocol      = htons(17);
+            v.major_version = htons(SUPP_MAJ_VER);
+            v.minor_version = htons(SUPP_MIN_VER);
+
+            sendto(sock, &v, sizeof(v), 0,
+                   reinterpret_cast<sockaddr*>(&from), fromLen);
+            continue;
+        }
+
+        std::cout << "Malformed packet – ignored.\n";
+
+        /* GC jobs  */
+gc:
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = jobs.begin(); it != jobs.end(); ) {
+            if (it->second.deadline < now) {
+                DBG(std::cerr << "Job for "
+                              << addrToString(it->first.s, it->first.len)
+                              << " expired.\n");
+                it = jobs.erase(it);
+            } else ++it;
+        }
     }
-    if (static_cast<size_t>(got) != sizeof(calcMessage)) {
-        std::cerr << "ERROR WRONG SIZE OR INCORRECT PROTOCOL\n";
-        return 1;
-    }
-
-    uint32_t m = ntohl(verdict.message);
-    std::cout << (m == 1 ? "OK" : "ERROR")
-              << " (myresult="
-              << (arith <= 4 ? std::to_string(iRes)
-                             : std::to_string(fRes))
-              << ")\n";
-
-    return 0;
 }
